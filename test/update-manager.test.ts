@@ -305,6 +305,17 @@ test("resolves global and isolated npm install targets on macOS and Windows", ()
       global: true
     }
   );
+  assert.deepEqual(
+    resolveNpmInstallTarget(
+      "/Users/tester/Library/pnpm/global/5/node_modules/.pnpm/codex-weixin@0.4.1/node_modules/codex-weixin",
+      "darwin"
+    ),
+    {
+      installPrefix: "/Users/tester/Library/pnpm/global/5",
+      packageRoot: "/Users/tester/Library/pnpm/global/5/node_modules/.pnpm/codex-weixin@0.4.1/node_modules/codex-weixin",
+      global: false
+    }
+  );
   assert.equal(
     resolveNpmInstallPrefix("/opt/homebrew/lib/node_modules/codex-weixin", "darwin"),
     "/opt/homebrew"
