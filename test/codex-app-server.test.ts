@@ -179,3 +179,58 @@ test("streaming fallback to exec sends only the final answer", async (t) => {
   assert.match(result.text, /used codex exec fallback/i);
   assert.match(result.text, /exec-new/);
 });
+
+test("lists local Codex sessions across app-server sources", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  const sessions = await runner.listCodexSessions({ searchTerm: "迷宫" });
+
+  assert.deepEqual(sessions, [{
+    id: "thread-external",
+    title: "迷宫闯关游戏",
+    preview: "继续完善迷宫地图与关卡",
+    workspace: "/tmp/external-project",
+    source: "vscode",
+    updatedAt: "2023-11-14T22:15:00.000Z",
+    model: "gpt-test",
+    effort: "high"
+  }]);
+});
+
+test("sets a Codex goal and streams subsequent automatic turns", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  const progress: string[] = [];
+  let resolveFinal: ((value: string) => void) | undefined;
+  const final = new Promise<string>((resolve) => {
+    resolveFinal = resolve;
+  });
+
+  const result = await runner.setGoal({
+    threadId: "thread-existing",
+    cwd: "/tmp/project",
+    objective: "完成迷宫闯关游戏的下一个关卡",
+    status: "active",
+    onProgress: (message) => {
+      progress.push(message);
+    },
+    onFinal: (result) => {
+      resolveFinal?.(result.text);
+    }
+  });
+
+  assert.equal(result.threadId, "thread-existing");
+  assert.equal(result.goal.objective, "完成迷宫闯关游戏的下一个关卡");
+  assert.equal(await final, "reply:完成迷宫闯关游戏的下一个关卡");
+  assert.deepEqual(progress, ["working:完成迷宫闯关游戏的下一个关卡"]);
+  assert.equal((await runner.getGoal("thread-existing"))?.status, "complete");
+  assert.equal(await runner.clearGoal("thread-existing"), true);
+});
