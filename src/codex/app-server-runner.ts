@@ -5,6 +5,7 @@ import { resolveCodexCommand, type CodexRunResult } from "./exec-runner.js";
 
 export type AppServerRunnerOptions = {
   codexBin?: string;
+  codexHome?: string;
   requestTimeoutMs?: number;
 };
 
@@ -30,6 +31,56 @@ export type CodexRuntimeInfo = {
   model?: string;
   effort?: string;
   provider?: string;
+};
+
+export type CodexGoalStatus =
+  | "active"
+  | "paused"
+  | "blocked"
+  | "usageLimited"
+  | "budgetLimited"
+  | "complete";
+
+export type CodexGoal = {
+  threadId: string;
+  objective: string;
+  status: CodexGoalStatus;
+  tokenBudget?: number;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type CodexSessionSummary = {
+  id: string;
+  title: string;
+  preview: string;
+  workspace: string;
+  source: string;
+  updatedAt: string;
+  model?: string;
+  effort?: string;
+};
+
+export type CodexSessionListOptions = {
+  searchTerm?: string;
+  limit?: number;
+};
+
+export type CodexGoalRunInput = {
+  cwd: string;
+  threadId?: string;
+  model?: string;
+  effort?: string;
+  objective?: string;
+  status?: CodexGoalStatus;
+  tokenBudget?: number | null;
+  onDelta?: (delta: string) => Promise<void> | void;
+  onProgress?: (message: string) => Promise<void> | void;
+  onFinal?: (result: CodexRunResult) => Promise<void> | void;
+  onError?: (error: Error) => Promise<void> | void;
+  onStopped?: (input: { goal?: CodexGoal; reason: "inactive" | "idle" | "transport" }) => Promise<void> | void;
 };
 
 export type CodexModelOption = {
@@ -77,6 +128,15 @@ type QueuedTurnEvent = {
   text: string;
 };
 
+type GoalObserver = {
+  threadId: string;
+  callbacks: Pick<CodexGoalRunInput, "onDelta" | "onProgress" | "onFinal" | "onError" | "onStopped">;
+  goal?: CodexGoal;
+  activeTurnKeys: Set<string>;
+  quietTimer?: NodeJS.Timeout;
+  finalizeReason?: "inactive" | "idle";
+};
+
 type WireMessage = {
   id?: JsonRpcId;
   method?: string;
@@ -107,6 +167,10 @@ export class AppServerCodexRunner {
   private readonly queuedTurnEvents = new Map<string, QueuedTurnEvent[]>();
   private readonly itemPhasesByTurn = new Map<string, Map<string, string>>();
   private readonly runtimeInfoByThread = new Map<string, CodexRuntimeInfo>();
+  private readonly manualTurnStarts = new Map<string, number>();
+  private readonly manualTurnKeys = new Set<string>();
+  private readonly observedTurnKeys = new Map<string, string>();
+  private readonly goalObservers = new Map<string, GoalObserver>();
   private modelOptions?: CodexModelOption[];
 
   constructor(private readonly options: AppServerRunnerOptions = {}) {}
@@ -130,23 +194,30 @@ export class AppServerCodexRunner {
     }
     this.runtimeInfoByThread.set(threadId, runtimeInfoFromThreadResponse(threadResponse));
 
-    const turnResponse = await this.request("turn/start", compactObject({
-      threadId,
-      input: [{ type: "text", text: input.prompt, text_elements: [] }],
-      cwd: input.cwd,
-      approvalPolicy: "never",
-      model: input.model,
-      effort: input.effort
-    })) as Record<string, unknown>;
+    this.beginManualTurnStart(threadId);
+    let turnResponse: Record<string, unknown>;
+    try {
+      turnResponse = await this.request("turn/start", compactObject({
+        threadId,
+        input: [{ type: "text", text: input.prompt, text_elements: [] }],
+        cwd: input.cwd,
+        approvalPolicy: "never",
+        model: input.model,
+        effort: input.effort
+      })) as Record<string, unknown>;
+    } finally {
+      this.finishManualTurnStart(threadId);
+    }
     const turn = turnResponse.turn as Record<string, unknown> | undefined;
     const turnId = typeof turn?.id === "string" ? turn.id : undefined;
     if (!turnId) {
       throw new Error("Codex app-server did not return a turn id");
     }
 
+    const key = turnKey(threadId, turnId);
+    this.manualTurnKeys.add(key);
     this.activeTurns.set(threadId, turnId);
     if (input.onDelta || input.onProgress) {
-      const key = turnKey(threadId, turnId);
       this.turnStreams.set(key, {
         onDelta: input.onDelta,
         onProgress: input.onProgress,
@@ -163,6 +234,97 @@ export class AppServerCodexRunner {
   async listSessions(): Promise<unknown> {
     await this.ensureConnected();
     return this.request("thread/list", {});
+  }
+
+  async listCodexSessions(options: CodexSessionListOptions = {}): Promise<CodexSessionSummary[]> {
+    await this.ensureConnected();
+    const response = await this.request("thread/list", compactObject({
+      limit: Math.max(1, Math.min(options.limit ?? 40, 100)),
+      sortKey: "updated_at",
+      sortDirection: "desc",
+      sourceKinds: ["cli", "vscode", "exec", "appServer"],
+      searchTerm: options.searchTerm?.trim() || undefined
+    })) as Record<string, unknown>;
+    const data = Array.isArray(response.data) ? response.data : [];
+    return data.flatMap((value) => {
+      const session = parseCodexSession(value);
+      return session ? [session] : [];
+    });
+  }
+
+  async readCodexSession(threadId: string): Promise<CodexSessionSummary | undefined> {
+    await this.ensureConnected();
+    const response = await this.request("thread/read", {
+      threadId,
+      includeTurns: false
+    }) as Record<string, unknown>;
+    return parseCodexSession(response.thread);
+  }
+
+  async getGoal(threadId: string): Promise<CodexGoal | undefined> {
+    await this.ensureConnected();
+    const response = await this.request("thread/goal/get", { threadId }) as Record<string, unknown>;
+    return parseCodexGoal(response.goal);
+  }
+
+  async setGoal(input: CodexGoalRunInput): Promise<{ threadId: string; goal: CodexGoal }> {
+    await this.ensureConnected();
+    const threadResponse = await this.request(
+      input.threadId ? "thread/resume" : "thread/start",
+      compactObject({
+        ...(input.threadId ? { threadId: input.threadId } : {}),
+        cwd: input.cwd,
+        model: input.model,
+        approvalPolicy: "never"
+      })
+    ) as Record<string, unknown>;
+    const thread = threadResponse.thread as Record<string, unknown> | undefined;
+    const threadId = typeof thread?.id === "string" ? thread.id : input.threadId;
+    if (!threadId) {
+      throw new Error("Codex app-server did not return a thread id");
+    }
+    this.runtimeInfoByThread.set(threadId, runtimeInfoFromThreadResponse(threadResponse));
+
+    const shouldObserve = input.status === "active"
+      || (input.status === undefined && Boolean(input.objective));
+    if (shouldObserve) {
+      this.registerGoalObserver(threadId, input);
+    }
+
+    try {
+      const response = await this.request("thread/goal/set", compactObject({
+        threadId,
+        objective: input.objective,
+        status: input.status,
+        tokenBudget: input.tokenBudget
+      })) as Record<string, unknown>;
+      const goal = parseCodexGoal(response.goal);
+      if (!goal) {
+        throw new Error("Codex app-server did not return a goal");
+      }
+      const observer = this.goalObservers.get(threadId);
+      if (observer) {
+        observer.goal = goal;
+        if (goal.status !== "active") {
+          this.scheduleGoalFinalize(observer, "inactive");
+        } else {
+          this.scheduleGoalIdleCheck(observer);
+        }
+      }
+      return { threadId, goal };
+    } catch (error) {
+      const observer = this.goalObservers.get(threadId);
+      if (observer && shouldObserve) {
+        this.finalizeGoalObserver(observer, "inactive");
+      }
+      throw error;
+    }
+  }
+
+  async clearGoal(threadId: string): Promise<boolean> {
+    await this.ensureConnected();
+    const response = await this.request("thread/goal/clear", { threadId }) as Record<string, unknown>;
+    return response.cleared === true;
   }
 
   async getHistory(threadId: string): Promise<CodexHistoryMessage[]> {
@@ -262,7 +424,10 @@ export class AppServerCodexRunner {
     const child = spawn(command.command, [...command.argsPrefix, "app-server", "--stdio"], {
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
-      windowsHide: true
+      windowsHide: true,
+      env: this.options.codexHome
+        ? { ...process.env, CODEX_HOME: this.options.codexHome }
+        : undefined
     });
     this.child = child;
     this.stderr = "";
@@ -289,7 +454,7 @@ export class AppServerCodexRunner {
           version: "0.2.0"
         },
         capabilities: {
-          experimentalApi: false,
+          experimentalApi: true,
           requestAttestation: false
         }
       }, Math.min(this.options.requestTimeoutMs ?? 600_000, 15_000));
@@ -371,6 +536,65 @@ export class AppServerCodexRunner {
   }
 
   private handleNotification(method: string, params: Record<string, unknown>, raw: string): void {
+    if (method === "thread/goal/updated") {
+      const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
+      const goal = parseCodexGoal(params.goal);
+      const observer = threadId ? this.goalObservers.get(threadId) : undefined;
+      if (observer && goal) {
+        observer.goal = goal;
+        if (goal.status === "active") {
+          observer.finalizeReason = undefined;
+          this.scheduleGoalIdleCheck(observer);
+        } else {
+          this.scheduleGoalFinalize(observer, "inactive");
+        }
+      }
+      return;
+    }
+
+    if (method === "thread/goal/cleared") {
+      const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
+      const observer = threadId ? this.goalObservers.get(threadId) : undefined;
+      if (observer) {
+        this.scheduleGoalFinalize(observer, "inactive");
+      }
+      return;
+    }
+
+    if (method === "turn/started") {
+      const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
+      const turn = params.turn as Record<string, unknown> | undefined;
+      const turnId = typeof turn?.id === "string" ? turn.id : undefined;
+      if (!threadId || !turnId) {
+        return;
+      }
+      this.activeTurns.set(threadId, turnId);
+      const key = turnKey(threadId, turnId);
+      const pendingManualStarts = this.manualTurnStarts.get(threadId) ?? 0;
+      if (pendingManualStarts > 0 || this.manualTurnKeys.has(key)) {
+        if (pendingManualStarts > 0) {
+          this.manualTurnStarts.set(threadId, pendingManualStarts - 1);
+        }
+        if (this.manualTurnKeys.has(key)) {
+          this.manualTurnKeys.delete(key);
+        }
+        return;
+      }
+      const observer = this.goalObservers.get(threadId);
+      if (!observer) {
+        return;
+      }
+      this.clearGoalTimer(observer);
+      observer.activeTurnKeys.add(key);
+      this.observedTurnKeys.set(key, threadId);
+      this.turnStreams.set(key, {
+        onDelta: observer.callbacks.onDelta,
+        onProgress: observer.callbacks.onProgress,
+        chain: Promise.resolve()
+      });
+      return;
+    }
+
     if (method === "item/started") {
       const key = turnKeyFromParams(params);
       const item = params.item as Record<string, unknown> | undefined;
@@ -435,6 +659,7 @@ export class AppServerCodexRunner {
     }
     const key = turnKey(threadId, turnId);
     this.appendTurnEvent(key, raw);
+    this.manualTurnKeys.delete(key);
     const status = typeof turn?.status === "string" ? turn.status : "completed";
     const errorValue = turn?.error as Record<string, unknown> | undefined;
     const completion: TurnCompletion = {
@@ -444,6 +669,15 @@ export class AppServerCodexRunner {
       error: typeof errorValue?.message === "string" ? errorValue.message : undefined
     };
     this.activeTurns.delete(threadId);
+    const observedThreadId = this.observedTurnKeys.get(key);
+    if (observedThreadId) {
+      this.observedTurnKeys.delete(key);
+      const observer = this.goalObservers.get(observedThreadId);
+      if (observer) {
+        void this.finishObservedGoalTurn(observer, key, completion);
+        return;
+      }
+    }
     const waiter = this.turnWaiters.get(key);
     if (!waiter) {
       this.completedTurns.set(key, completion);
@@ -484,12 +718,8 @@ export class AppServerCodexRunner {
     reject: (error: Error) => void
   ): Promise<void> {
     const stream = this.turnStreams.get(key);
-    this.turnStreams.delete(key);
     await stream?.chain;
-    this.turnEvents.delete(key);
-    this.turnTexts.delete(key);
-    this.queuedTurnEvents.delete(key);
-    this.itemPhasesByTurn.delete(key);
+    this.clearTurnTracking(key);
     if (completion.status === "completed") {
       resolve({ text: completion.text, threadId, raw: completion.raw });
       return;
@@ -499,6 +729,132 @@ export class AppServerCodexRunner {
       return;
     }
     reject(new Error(completion.error ?? `Codex app-server turn ended with status ${completion.status}`));
+  }
+
+  private async finishObservedGoalTurn(
+    observer: GoalObserver,
+    key: string,
+    completion: TurnCompletion
+  ): Promise<void> {
+    const stream = this.turnStreams.get(key);
+    await stream?.chain;
+    this.clearTurnTracking(key);
+    observer.activeTurnKeys.delete(key);
+
+    try {
+      if (completion.status === "completed") {
+        await observer.callbacks.onFinal?.({
+          text: completion.text,
+          threadId: observer.threadId,
+          raw: completion.raw
+        });
+      } else if (completion.status !== "interrupted") {
+        await observer.callbacks.onError?.(
+          new Error(completion.error ?? `Codex goal turn ended with status ${completion.status}`)
+        );
+      }
+    } catch (error) {
+      console.warn(`Codex goal output callback failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (this.goalObservers.get(observer.threadId) !== observer) {
+      return;
+    }
+    if (observer.finalizeReason === "inactive" || (observer.goal && observer.goal.status !== "active")) {
+      this.scheduleGoalFinalize(observer, "inactive");
+    } else {
+      this.scheduleGoalIdleCheck(observer);
+    }
+  }
+
+  private registerGoalObserver(threadId: string, input: CodexGoalRunInput): GoalObserver {
+    const previous = this.goalObservers.get(threadId);
+    if (previous) {
+      this.clearGoalTimer(previous);
+    }
+    const observer: GoalObserver = {
+      threadId,
+      callbacks: {
+        onDelta: input.onDelta,
+        onProgress: input.onProgress,
+        onFinal: input.onFinal,
+        onError: input.onError,
+        onStopped: input.onStopped
+      },
+      activeTurnKeys: new Set()
+    };
+    this.goalObservers.set(threadId, observer);
+    return observer;
+  }
+
+  private scheduleGoalIdleCheck(observer: GoalObserver): void {
+    this.clearGoalTimer(observer);
+    if (observer.activeTurnKeys.size > 0 || this.goalObservers.get(observer.threadId) !== observer) {
+      return;
+    }
+    observer.quietTimer = setTimeout(() => {
+      observer.quietTimer = undefined;
+      if (observer.activeTurnKeys.size === 0) {
+        this.finalizeGoalObserver(observer, "idle");
+      }
+    }, 15_000);
+  }
+
+  private scheduleGoalFinalize(observer: GoalObserver, reason: "inactive"): void {
+    observer.finalizeReason = reason;
+    this.clearGoalTimer(observer);
+    if (observer.activeTurnKeys.size > 0) {
+      return;
+    }
+    observer.quietTimer = setTimeout(() => {
+      observer.quietTimer = undefined;
+      if (observer.activeTurnKeys.size === 0) {
+        this.finalizeGoalObserver(observer, reason);
+      }
+    }, 50);
+  }
+
+  private finalizeGoalObserver(observer: GoalObserver, reason: "inactive" | "idle"): void {
+    if (this.goalObservers.get(observer.threadId) !== observer) {
+      return;
+    }
+    this.clearGoalTimer(observer);
+    this.goalObservers.delete(observer.threadId);
+    for (const key of observer.activeTurnKeys) {
+      this.turnStreams.delete(key);
+      this.observedTurnKeys.delete(key);
+      this.clearTurnTracking(key);
+    }
+    void observer.callbacks.onStopped?.({ goal: observer.goal, reason });
+  }
+
+  private clearGoalTimer(observer: GoalObserver): void {
+    if (observer.quietTimer) {
+      clearTimeout(observer.quietTimer);
+      observer.quietTimer = undefined;
+    }
+  }
+
+  private clearTurnTracking(key: string): void {
+    this.turnStreams.delete(key);
+    this.turnEvents.delete(key);
+    this.turnTexts.delete(key);
+    this.queuedTurnEvents.delete(key);
+    this.itemPhasesByTurn.delete(key);
+    this.manualTurnKeys.delete(key);
+  }
+
+  private beginManualTurnStart(threadId: string): void {
+    this.manualTurnStarts.set(threadId, (this.manualTurnStarts.get(threadId) ?? 0) + 1);
+  }
+
+  private finishManualTurnStart(threadId: string): void {
+    const remaining = (this.manualTurnStarts.get(threadId) ?? 1) - 1;
+    if (remaining > 0) {
+      this.manualTurnStarts.set(threadId, remaining);
+    } else {
+      this.manualTurnStarts.delete(threadId);
+    }
   }
 
   private appendTurnEvent(key: string, raw: string): void {
@@ -600,6 +956,14 @@ export class AppServerCodexRunner {
     this.queuedTurnEvents.clear();
     this.itemPhasesByTurn.clear();
     this.runtimeInfoByThread.clear();
+    this.manualTurnStarts.clear();
+    this.manualTurnKeys.clear();
+    this.observedTurnKeys.clear();
+    for (const observer of this.goalObservers.values()) {
+      this.clearGoalTimer(observer);
+      void observer.callbacks.onStopped?.({ goal: observer.goal, reason: "transport" });
+    }
+    this.goalObservers.clear();
     this.modelOptions = undefined;
   }
 }
@@ -637,6 +1001,91 @@ function parseModelOption(value: unknown): CodexModelOption | undefined {
       : {}),
     supportedEfforts: efforts
   };
+}
+
+function parseCodexGoal(value: unknown): CodexGoal | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const goal = value as Record<string, unknown>;
+  const threadId = typeof goal.threadId === "string" ? goal.threadId : "";
+  const objective = typeof goal.objective === "string" ? goal.objective : "";
+  const status = parseGoalStatus(goal.status);
+  if (!threadId || !objective || !status) {
+    return undefined;
+  }
+  return {
+    threadId,
+    objective,
+    status,
+    ...(typeof goal.tokenBudget === "number" ? { tokenBudget: goal.tokenBudget } : {}),
+    tokensUsed: typeof goal.tokensUsed === "number" ? goal.tokensUsed : 0,
+    timeUsedSeconds: typeof goal.timeUsedSeconds === "number" ? goal.timeUsedSeconds : 0,
+    ...(unixSecondsToIso(goal.createdAt) ? { createdAt: unixSecondsToIso(goal.createdAt) } : {}),
+    ...(unixSecondsToIso(goal.updatedAt) ? { updatedAt: unixSecondsToIso(goal.updatedAt) } : {})
+  };
+}
+
+function parseGoalStatus(value: unknown): CodexGoalStatus | undefined {
+  return value === "active"
+    || value === "paused"
+    || value === "blocked"
+    || value === "usageLimited"
+    || value === "budgetLimited"
+    || value === "complete"
+    ? value
+    : undefined;
+}
+
+function parseCodexSession(value: unknown): CodexSessionSummary | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const session = value as Record<string, unknown>;
+  const id = typeof session.id === "string" ? session.id : "";
+  if (!id) {
+    return undefined;
+  }
+  const preview = cleanSingleLine(session.preview);
+  const name = cleanSingleLine(session.name);
+  const workspace = typeof session.cwd === "string" ? session.cwd : "";
+  const source = formatThreadSource(session.source);
+  return {
+    id,
+    title: name ?? preview ?? id,
+    preview: preview ?? "暂无内容摘要",
+    workspace,
+    source,
+    updatedAt: unixSecondsToIso(session.updatedAt ?? session.recencyAt ?? session.createdAt) ?? new Date(0).toISOString(),
+    ...(typeof session.model === "string" && session.model ? { model: session.model } : {}),
+    ...(typeof session.reasoningEffort === "string" && session.reasoningEffort
+      ? { effort: session.reasoningEffort }
+      : {})
+  };
+}
+
+function cleanSingleLine(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const clean = value.replace(/\s+/g, " ").trim();
+  return clean || undefined;
+}
+
+function formatThreadSource(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value && typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    if (typeof source.custom === "string") {
+      return source.custom;
+    }
+    if (source.subAgent !== undefined) {
+      return "subAgent";
+    }
+  }
+  return "unknown";
 }
 
 function runtimeInfoFromThreadResponse(response: Record<string, unknown>): CodexRuntimeInfo {
