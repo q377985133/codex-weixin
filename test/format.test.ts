@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildPrompt, buildPromptPreview, parsePrompt, stripBridgeInstructions } from "../src/bridge/format.js";
+import { buildPrompt, buildPromptPreview, chunkText, parsePrompt, stripBridgeInstructions } from "../src/bridge/format.js";
 
 test("prompt asks Codex to use native send actions for local media", () => {
   const prompt = buildPrompt("send me a random video from desktop");
@@ -59,4 +59,9 @@ test("builds a bounded session preview without local attachment paths", () => {
   assert.equal(buildPromptPreview("", [{ kind: "video", label: "demo.mp4" }]), "视频：demo.mp4");
   assert.equal(buildPromptPreview("x".repeat(130))?.length, 120);
   assert.equal(buildPromptPreview("x".repeat(130))?.endsWith("…"), true);
+});
+
+test("returns no WeChat chunks when a turn has no visible text", () => {
+  assert.deepEqual(chunkText(""), []);
+  assert.deepEqual(chunkText("   \n  "), []);
 });
