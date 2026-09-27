@@ -6,6 +6,7 @@ const rl = readline.createInterface({ input: process.stdin });
 let initialized = false;
 let nextTurn = 1;
 const activeTurns = new Map();
+const goals = new Map();
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -30,6 +31,69 @@ function completedTurn(id, status, error = null) {
     completedAt: 2,
     durationMs: 1
   };
+}
+
+function beginTurn(threadId, prompt) {
+  const turnId = `turn-${nextTurn++}`;
+  activeTurns.set(threadId, turnId);
+  send({
+    method: "turn/started",
+    params: { threadId, turn: completedTurn(turnId, "inProgress") }
+  });
+  setTimeout(() => {
+    const progressItemId = `progress-${turnId}`;
+    send({
+      method: "item/started",
+      params: {
+        threadId,
+        turnId,
+        item: { type: "agentMessage", id: progressItemId, text: "", phase: "commentary", memoryCitation: null }
+      }
+    });
+    send({
+      method: "item/agentMessage/delta",
+      params: { threadId, turnId, itemId: progressItemId, delta: `working:${prompt}` }
+    });
+    send({
+      method: "item/completed",
+      params: {
+        threadId,
+        turnId,
+        completedAtMs: Date.now(),
+        item: { type: "agentMessage", id: progressItemId, text: `working:${prompt}`, phase: "commentary", memoryCitation: null }
+      }
+    });
+    const itemId = `item-${turnId}`;
+    send({
+      method: "item/started",
+      params: {
+        threadId,
+        turnId,
+        item: { type: "agentMessage", id: itemId, text: "", phase: "final_answer", memoryCitation: null }
+      }
+    });
+    for (const delta of ["reply:", prompt]) {
+      send({
+        method: "item/agentMessage/delta",
+        params: { threadId, turnId, itemId, delta }
+      });
+    }
+    send({
+      method: "item/completed",
+      params: {
+        threadId,
+        turnId,
+        completedAtMs: Date.now(),
+        item: { type: "agentMessage", id: itemId, text: `reply:${prompt}`, phase: "final_answer", memoryCitation: null }
+      }
+    });
+    send({
+      method: "turn/completed",
+      params: { threadId, turn: completedTurn(turnId, "completed") }
+    });
+    activeTurns.delete(threadId);
+  }, 5);
+  return turnId;
 }
 
 rl.on("line", (line) => {
@@ -118,7 +182,91 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "thread/list") {
+    if (Array.isArray(message.params?.sourceKinds)) {
+      const sessions = [
+        {
+          id: "thread-external",
+          preview: "继续完善迷宫地图与关卡",
+          name: "迷宫闯关游戏",
+          cwd: "/tmp/external-project",
+          source: "vscode",
+          updatedAt: 1_700_000_100,
+          model: "gpt-test",
+          reasoningEffort: "high"
+        },
+        {
+          id: "thread-other",
+          preview: "整理季度报告",
+          name: "季度报告",
+          cwd: "/tmp/reports",
+          source: "cli",
+          updatedAt: 1_700_000_000,
+          model: null,
+          reasoningEffort: null
+        }
+      ];
+      const searchTerm = String(message.params?.searchTerm ?? "").toLowerCase();
+      const filtered = searchTerm
+        ? sessions.filter((session) => session.name.toLowerCase().includes(searchTerm))
+        : sessions;
+      respond(message.id, { data: filtered, nextCursor: null, backwardsCursor: null });
+      return;
+    }
     respond(message.id, { data: [{ id: "thread-new" }], nextCursor: null, backwardsCursor: null });
+    return;
+  }
+
+  if (message.method === "thread/goal/set") {
+    const previous = goals.get(message.params.threadId);
+    const objective = typeof message.params.objective === "string"
+      ? message.params.objective
+      : previous?.objective;
+    const status = message.params.status ?? previous?.status ?? "active";
+    if (!objective) {
+      fail(message.id, "objective is required for a new goal");
+      return;
+    }
+    const goal = {
+      threadId: message.params.threadId,
+      objective,
+      status,
+      tokenBudget: message.params.tokenBudget ?? null,
+      tokensUsed: previous?.tokensUsed ?? 0,
+      timeUsedSeconds: previous?.timeUsedSeconds ?? 0,
+      createdAt: previous?.createdAt ?? 1_700_000_000,
+      updatedAt: 1_700_000_001
+    };
+    goals.set(message.params.threadId, goal);
+    respond(message.id, { goal });
+    send({
+      method: "thread/goal/updated",
+      params: { threadId: goal.threadId, turnId: null, goal }
+    });
+    if (status === "active" && !activeTurns.has(goal.threadId)) {
+      beginTurn(goal.threadId, goal.objective);
+      setTimeout(() => {
+        const completed = { ...goal, status: "complete", updatedAt: 1_700_000_002 };
+        goals.set(goal.threadId, completed);
+        send({
+          method: "thread/goal/updated",
+          params: { threadId: goal.threadId, turnId: null, goal: completed }
+        });
+      }, 1);
+    }
+    return;
+  }
+
+  if (message.method === "thread/goal/get") {
+    respond(message.id, { goal: goals.get(message.params.threadId) ?? null });
+    return;
+  }
+
+  if (message.method === "thread/goal/clear") {
+    const cleared = goals.delete(message.params.threadId);
+    respond(message.id, { cleared });
+    if (cleared) {
+      send({ method: "thread/goal/cleared", params: { threadId: message.params.threadId } });
+    }
     return;
   }
 
@@ -163,12 +311,12 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "turn/start") {
-    const turnId = `turn-${nextTurn++}`;
     const prompt = message.params?.input?.[0]?.text;
     if (message.params?.input?.[0]?.type !== "text" || typeof prompt !== "string") {
       fail(message.id, "turn/start requires text input");
       return;
     }
+    const turnId = `turn-${nextTurn++}`;
     activeTurns.set(message.params.threadId, turnId);
     respond(message.id, { turn: completedTurn(turnId, "inProgress") });
     if (prompt === "hold") {
