@@ -2,6 +2,29 @@
 
 All notable changes to `codex-weixin` are documented in this file.
 
+## [0.4.1] - 2026-09-27
+
+### Changed
+
+- Merged the fixes published in npm `0.3.9` through `0.3.14` into the GitHub-based fork.
+- Added isolated Codex homes for bridge runs so unrelated global MCP and plugin configuration cannot interrupt WeChat turns.
+- Added automatic recovery when a saved Codex thread has been archived.
+- Suppressed placeholder WeChat replies for turns that only return native media actions.
+- Added GPT-6 Astra to the IkunCoding provider family and updated pnpm/global npm install-target detection.
+
+## [0.4.0] - 2026-09-27
+
+### Added
+
+- Added Codex Goal mode commands for WeChat: `/goal <objective>`, `/goal edit`, `/goal pause`, `/goal resume`, `/goal clear`, `/goal budget`, and `/goal` status.
+- Added a goal observer that routes Codex app-server-owned automatic goal turns, progress updates, and final answers back to the originating WeChat conversation.
+- Added `/sessions [keyword]`, `/session <S-number|id|name>`, and `/resume <session name>` to search and import other local Codex CLI, Desktop, app-server, and exec sessions.
+
+### Security
+
+- Imported external sessions must use a workspace inside the configured allowlist.
+- Goal objectives are limited to 4,000 characters and token budgets must be positive integers or explicitly removed.
+
 ## [0.3.8] - 2026-07-20
 
 ### Fixed
