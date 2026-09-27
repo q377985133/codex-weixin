@@ -204,11 +204,16 @@ test("keeps the GPT-5.6 provider family available after selecting another model"
   setRuntimeInfo({ model: "gpt-5.5", effort: "xhigh", provider: "IkunCoding" });
 
   const models = await manager.getCodexModels();
-  assert.deepEqual(models.slice(0, 3).map((model) => model.model), [
+  assert.deepEqual(models.slice(0, 4).map((model) => model.model), [
+    "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna"
   ]);
+  assert.deepEqual(
+    models.find((model) => model.model === "gpt-6-astra")?.supportedEfforts.map((option) => option.effort),
+    ["low", "medium", "high", "xhigh", "max", "ultra"]
+  );
   assert.deepEqual(
     models.find((model) => model.model === "gpt-5.6-sol")?.supportedEfforts.map((option) => option.effort),
     ["low", "medium", "high", "xhigh", "max", "ultra"]
