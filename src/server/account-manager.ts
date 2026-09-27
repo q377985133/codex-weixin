@@ -599,6 +599,11 @@ function addProviderModelFamily(models: CodexModelOption[], provider?: string): 
   }
   const commonEfforts = ["low", "medium", "high", "xhigh", "max"];
   const descriptions: Record<string, { displayName: string; description: string; efforts: string[] }> = {
+    "gpt-6-astra": {
+      displayName: "GPT-6 Astra",
+      description: "Latest frontier agentic coding model.",
+      efforts: [...commonEfforts, "ultra"]
+    },
     "gpt-5.6-sol": {
       displayName: "GPT-5.6 Sol",
       description: "Frontier agentic coding model for complex work.",
