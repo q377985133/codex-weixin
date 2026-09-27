@@ -673,3 +673,246 @@ test("preserves the tail of a long final answer with bounded WeChat chunks", asy
   assert.equal(finalChunks.join(""), finalText);
   assert.match(finalChunks.at(-1) ?? "", /来源：arXiv 官方作者检索。$/);
 });
+
+test("searches other Codex sessions, imports one by name, and continues its thread", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-global-session-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const replies: string[] = [];
+  const runs: Array<{ prompt: string; threadId?: string; cwd: string }> = [];
+  const codexSession = {
+    id: "thread-maze",
+    title: "迷宫闯关游戏",
+    preview: "继续完善迷宫地图与关卡",
+    workspace: tmpDir,
+    source: "vscode",
+    updatedAt: "2026-09-27T01:00:00.000Z",
+    model: "gpt-test",
+    effort: "high"
+  };
+  const service = new BridgeService({
+    config: {
+      ...defaultConfig(tmpDir),
+      allowedSenderIds: ["alice@im.wechat"]
+    },
+    stateStore,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) {
+        replies.push(input.text);
+        return { messageId: `text-${replies.length}` };
+      }
+    } as never,
+    runner: {
+      async listCodexSessions() {
+        return [codexSession];
+      },
+      async run(input: { prompt: string; threadId?: string; cwd: string }) {
+        runs.push(input);
+        return { raw: "", text: "已完成下一关", threadId: input.threadId };
+      },
+      async stop() {}
+    } as never
+  });
+  const send = (id: string, text: string) => service.handleMessage({
+    id,
+    senderId: "alice@im.wechat",
+    contextToken: "ctx",
+    text,
+    raw: {}
+  });
+
+  await send("list-global", "/sessions 迷宫");
+  assert.match(replies.at(-1) ?? "", /\[S1\] 迷宫闯关游戏/);
+  assert.match(replies.at(-1) ?? "", /Codex Desktop/);
+  assert.match(replies.at(-1) ?? "", /继续完善迷宫地图与关卡/);
+
+  await send("resume-global", "/resume 迷宫闯关游戏");
+  assert.match(replies.at(-1) ?? "", /已接入 Codex 会话：迷宫闯关游戏/);
+  assert.equal(stateStore.getThread("alice@im.wechat"), "thread-maze");
+
+  await send("continue-global", "继续做下一个关卡");
+  assert.equal(runs.at(-1)?.threadId, "thread-maze");
+  assert.equal(runs.at(-1)?.cwd, tmpDir);
+  assert.equal(replies.at(-1), "已完成下一关");
+});
+
+test("rejects importing a Codex session outside the workspace allowlist", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-global-session-denied-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const replies: string[] = [];
+  const service = new BridgeService({
+    config: {
+      ...defaultConfig(tmpDir),
+      allowedSenderIds: ["alice@im.wechat"]
+    },
+    stateStore,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) {
+        replies.push(input.text);
+        return { messageId: `text-${replies.length}` };
+      }
+    } as never,
+    runner: {
+      async listCodexSessions() {
+        return [{
+          id: "thread-outside",
+          title: "外部项目",
+          preview: "继续外部项目",
+          workspace: "/outside/project",
+          source: "cli",
+          updatedAt: "2026-09-27T01:00:00.000Z"
+        }];
+      },
+      async stop() {}
+    } as never
+  });
+
+  await service.handleMessage({
+    id: "resume-denied",
+    senderId: "alice@im.wechat",
+    contextToken: "ctx",
+    text: "/resume 外部项目",
+    raw: {}
+  });
+
+  assert.match(replies.at(-1) ?? "", /位于未授权工作目录/);
+  assert.match(replies.at(-1) ?? "", /Web 设置/);
+  assert.equal(stateStore.getThread("alice@im.wechat"), undefined);
+});
+
+test("recovers from an archived Codex thread with a fresh thread", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-archived-thread-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  stateStore.ensureActiveSession("alice@im.wechat", tmpDir);
+  stateStore.setThread("alice@im.wechat", "thread-archived");
+  const replies: string[] = [];
+  const attempts: Array<string | undefined> = [];
+  const service = new BridgeService({
+    config: {
+      ...defaultConfig(tmpDir),
+      allowedSenderIds: ["alice@im.wechat"]
+    },
+    stateStore,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) {
+        replies.push(input.text);
+        return { messageId: `text-${replies.length}` };
+      }
+    } as never,
+    runner: {
+      async run(input: { threadId?: string }) {
+        attempts.push(input.threadId);
+        if (attempts.length === 1) {
+          throw new Error("session thread-archived is archived");
+        }
+        return { raw: "", text: "已在新 thread 继续", threadId: "thread-fresh" };
+      },
+      async stop() {}
+    } as never
+  });
+
+  await service.handleMessage({
+    id: "archived",
+    senderId: "alice@im.wechat",
+    contextToken: "ctx",
+    text: "继续任务",
+    raw: {}
+  });
+
+  assert.deepEqual(attempts, ["thread-archived", undefined]);
+  assert.equal(stateStore.getThread("alice@im.wechat"), "thread-fresh");
+  assert.equal(replies.at(-1), "已在新 thread 继续");
+});
+
+test("manages Codex goals and forwards automatic goal turns back to WeChat", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-goal-command-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const replies: string[] = [];
+  let goal: {
+    threadId: string;
+    objective: string;
+    status: "active" | "paused" | "complete";
+    tokensUsed: number;
+    timeUsedSeconds: number;
+  } | undefined;
+  const service = new BridgeService({
+    config: {
+      ...defaultConfig(tmpDir),
+      allowedSenderIds: ["alice@im.wechat"]
+    },
+    stateStore,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) {
+        replies.push(input.text);
+        return { messageId: `text-${replies.length}` };
+      }
+    } as never,
+    runner: {
+      async setGoal(input: {
+        threadId?: string;
+        objective?: string;
+        status: "active" | "paused";
+        onProgress?: (message: string) => Promise<void> | void;
+        onFinal?: (result: { text: string; threadId: string }) => Promise<void> | void;
+        onStopped?: () => Promise<void> | void;
+      }) {
+        goal = {
+          threadId: input.threadId ?? "thread-goal",
+          objective: input.objective ?? goal?.objective ?? "继续推进目标",
+          status: input.status,
+          tokensUsed: 12,
+          timeUsedSeconds: 3
+        };
+        if (input.status === "active") {
+          setTimeout(() => {
+            void input.onProgress?.("正在完成剩余关卡");
+          }, 0);
+          setTimeout(() => {
+            goal = { ...goal!, status: "complete" };
+            void input.onFinal?.({ text: "目标回合已完成", threadId: goal.threadId });
+            void input.onStopped?.();
+          }, 1);
+        }
+        return { threadId: goal.threadId, goal };
+      },
+      async getGoal() {
+        return goal;
+      },
+      async clearGoal() {
+        const cleared = Boolean(goal);
+        goal = undefined;
+        return cleared;
+      },
+      async stop() {}
+    } as never
+  });
+  const send = (id: string, text: string) => service.handleMessage({
+    id,
+    senderId: "alice@im.wechat",
+    contextToken: "ctx",
+    text,
+    raw: {}
+  });
+
+  await send("set-goal", "/goal 完成迷宫游戏的全部关卡并保持测试通过");
+  assert.match(replies[0] ?? "", /目标已设置：完成迷宫游戏的全部关卡并保持测试通过/);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(replies.includes("【目标进度】正在完成剩余关卡"), true);
+  assert.equal(replies.includes("目标回合已完成"), true);
+
+  await send("view-goal", "/goal");
+  assert.match(replies.at(-1) ?? "", /状态：已完成/);
+  assert.match(replies.at(-1) ?? "", /12 tokens/);
+
+  await send("pause-goal", "/goal pause");
+  assert.match(replies.at(-1) ?? "", /状态：已暂停/);
+  await send("clear-goal", "/goal clear");
+  assert.equal(replies.at(-1), "已清除当前目标。");
+});
