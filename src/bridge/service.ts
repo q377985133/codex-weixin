@@ -4,7 +4,13 @@ import { AccessController } from "./access.js";
 import { parseActionBlocks } from "./actions.js";
 import { buildPrompt, buildPromptPreview, chunkText, parsePrompt } from "./format.js";
 import { PromptBuffer } from "./prompt-buffer.js";
-import type { CodexModelOption, CodexRuntimeInfo } from "../codex/app-server-runner.js";
+import type {
+  CodexGoal,
+  CodexGoalStatus,
+  CodexModelOption,
+  CodexRuntimeInfo,
+  CodexSessionSummary
+} from "../codex/app-server-runner.js";
 import { HybridCodexRunner } from "../codex/runner.js";
 import { isWorkspaceAllowed, type CodexWeixinConfig } from "../state/config.js";
 import { RuntimeStateStore, type ManagedSession } from "../state/runtime-state.js";
@@ -98,6 +104,15 @@ export class BridgeService {
       case "resume":
         await this.handleResumeCommand(message.senderId, command.arg);
         return;
+      case "sessions":
+        await this.handleSessionsCommand(message.senderId, command.arg);
+        return;
+      case "session":
+        await this.handleSessionCommand(message.senderId, command.arg);
+        return;
+      case "goal":
+        await this.handleGoalCommand(message.senderId, command.arg);
+        return;
       case "model":
         await this.handleModelCommand(message.senderId, command.arg);
         return;
@@ -146,7 +161,11 @@ export class BridgeService {
           `   最近内容：${previews[index]}（${formatSessionTime(session.updatedAt)}）`
         );
       }
-      lines.push("", "发送 /resume R1 这类切换编号继续会话；R1 是切换编号，“会话 6”等是会话名称。");
+      lines.push(
+        "",
+        "发送 /resume R1 这类切换编号继续会话；R1 是切换编号，“会话 6”等是会话名称。",
+        "发送 /sessions [关键词] 可搜索并接入其他 Codex 会话。"
+      );
       for (const chunk of chunkText(lines.join("\n"))) {
         await this.reply(senderId, chunk);
       }
@@ -157,21 +176,183 @@ export class BridgeService {
       return;
     }
     const match = /^r([1-9]\d*)$/i.exec(input);
-    if (!match) {
-      await this.reply(senderId, "用法：/resume 或 /resume R<编号>，例如 /resume R1。");
+    if (match) {
+      const selected = sessions[Number(match[1]) - 1];
+      if (!selected) {
+        await this.reply(senderId, "没有这个切换编号。发送 /resume 查看可用的 R 编号。");
+        return;
+      }
+      await this.activateManagedSession(senderId, selected, input.toUpperCase());
       return;
     }
-    const selected = sessions[Number(match[1]) - 1];
-    if (!selected) {
-      await this.reply(senderId, "没有这个切换编号。发送 /resume 查看可用的 R 编号。");
+
+    const managedMatch = sessions.find((session) => session.title.toLowerCase() === input.toLowerCase());
+    if (managedMatch) {
+      await this.activateManagedSession(senderId, managedMatch, input);
       return;
     }
-    const preview = await this.sessionPromptPreview(selected);
-    this.options.stateStore.activateSession(selected.id);
+
+    const resolved = await this.resolveCodexSession(input);
+    if (resolved.status === "selected") {
+      await this.importCodexSession(senderId, resolved.session, input);
+      return;
+    }
+    if (resolved.status === "candidates") {
+      await this.reply(
+        senderId,
+        [
+          "找到多个匹配的 Codex 会话：",
+          formatCodexSessionList(resolved.sessions),
+          "",
+          "请发送 /session S1 这类编号接入，或输入更完整的会话名称。"
+        ].join("\n")
+      );
+      return;
+    }
+    if (resolved.status === "error") {
+      await this.reply(senderId, `无法搜索 Codex 会话：${resolved.message}`);
+      return;
+    }
+    await this.reply(senderId, "没有找到这个会话。发送 /sessions [关键词] 搜索其他 Codex 会话。");
+  }
+
+  private async activateManagedSession(senderId: string, session: ManagedSession, label: string): Promise<void> {
+    const preview = await this.sessionPromptPreview(session);
+    this.options.stateStore.activateSession(session.id);
     await this.reply(senderId, [
-      `已通过 ${input.toUpperCase()} 切换到：${selected.title}`,
+      `已通过 ${label} 切换到：${session.title}`,
       `最近内容：${preview}`,
-      selected.threadId ? "下一条消息将继续该历史会话。" : "该会话尚无历史内容，下一条消息将创建新上下文。"
+      session.threadId ? "下一条消息将继续该历史会话。" : "该会话尚无历史内容，下一条消息将创建新上下文。"
+    ].join("\n"));
+  }
+
+  private async handleSessionsCommand(senderId: string, arg: string): Promise<void> {
+    const query = arg.trim();
+    const sessions = await this.listCodexSessions(query || undefined);
+    if (!sessions) {
+      await this.reply(senderId, "无法读取 Codex 会话列表。请确认 Codex app-server 可用。");
+      return;
+    }
+    if (!sessions.length) {
+      await this.reply(senderId, query ? `没有找到包含“${query}”的 Codex 会话。` : "没有找到可接入的 Codex 会话。");
+      return;
+    }
+    const activeThreadId = this.options.stateStore.getThread(senderId);
+    const lines = [
+      query ? `Codex 会话（关键词：${query}）：` : "Codex 全局会话（最近更新优先）：",
+      formatCodexSessionList(sessions, activeThreadId),
+      "",
+      "发送 /session S1 接入，或直接发送 /resume <会话名称>。"
+    ];
+    for (const chunk of chunkText(lines.join("\n"))) {
+      await this.reply(senderId, chunk);
+    }
+  }
+
+  private async handleSessionCommand(senderId: string, arg: string): Promise<void> {
+    const input = arg.trim();
+    if (!input) {
+      await this.handleSessionsCommand(senderId, "");
+      return;
+    }
+    const resolved = await this.resolveCodexSession(input);
+    if (resolved.status === "selected") {
+      await this.importCodexSession(senderId, resolved.session, input);
+      return;
+    }
+    if (resolved.status === "candidates") {
+      await this.reply(senderId, [
+        "找到多个匹配的 Codex 会话：",
+        formatCodexSessionList(resolved.sessions),
+        "",
+        "请发送 /session S1 这类编号接入，或输入更完整的会话名称。"
+      ].join("\n"));
+      return;
+    }
+    if (resolved.status === "error") {
+      await this.reply(senderId, `无法搜索 Codex 会话：${resolved.message}`);
+      return;
+    }
+    await this.reply(senderId, "没有找到这个 Codex 会话。发送 /sessions [关键词] 搜索。");
+  }
+
+  private async listCodexSessions(searchTerm?: string): Promise<CodexSessionSummary[] | undefined> {
+    try {
+      return await this.runner.listCodexSessions({ searchTerm, limit: 40 });
+    } catch (error) {
+      console.warn(`Codex session list unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
+  }
+
+  private async resolveCodexSession(input: string): Promise<
+    | { status: "selected"; session: CodexSessionSummary }
+    | { status: "candidates"; sessions: CodexSessionSummary[] }
+    | { status: "none" }
+    | { status: "error"; message: string }
+  > {
+    const code = /^s([1-9]\d*)$/i.exec(input);
+    const sessions = await this.listCodexSessions(code ? undefined : input);
+    if (!sessions) {
+      return { status: "error", message: "Codex app-server 不可用" };
+    }
+    if (code) {
+      const selected = sessions[Number(code[1]) - 1];
+      return selected ? { status: "selected", session: selected } : { status: "none" };
+    }
+    const exact = sessions.filter((session) => session.title.toLowerCase() === input.toLowerCase());
+    if (exact.length === 1) {
+      return { status: "selected", session: exact[0] };
+    }
+    if (sessions.length === 1) {
+      return { status: "selected", session: sessions[0] };
+    }
+    if (sessions.length > 1) {
+      return { status: "candidates", sessions };
+    }
+    if (isUuid(input)) {
+      try {
+        const session = await this.runner.readCodexSession(input);
+        return session ? { status: "selected", session } : { status: "none" };
+      } catch (error) {
+        return { status: "error", message: error instanceof Error ? error.message : String(error) };
+      }
+    }
+    return { status: "none" };
+  }
+
+  private async importCodexSession(senderId: string, codexSession: CodexSessionSummary, label: string): Promise<void> {
+    const workspace = codexSession.workspace || this.options.config.defaultCwd;
+    if (!isWorkspaceAllowed(workspace, this.options.config.allowedWorkspaces)) {
+      await this.reply(senderId, [
+        `该 Codex 会话位于未授权工作目录：${workspace}`,
+        "请先在 Web 设置中把该目录加入允许的工作目录，再重新发送接入命令。"
+      ].join("\n"));
+      return;
+    }
+
+    const existing = this.options.stateStore.listSessions().find((session) => (
+      session.senderId === senderId && session.threadId === codexSession.id
+    ));
+    if (existing) {
+      this.options.stateStore.activateSession(existing.id);
+      await this.reply(senderId, [
+        `已通过 ${label} 切换到已有会话：${existing.title}`,
+        `Codex thread：${codexSession.id}`,
+        "下一条消息将继续该会话。"
+      ].join("\n"));
+      return;
+    }
+
+    const session = this.options.stateStore.createSession(senderId, workspace, codexSession.title);
+    this.options.stateStore.setSessionThread(session.id, codexSession.id);
+    this.options.stateStore.setSessionPromptPreview(session.id, codexSession.preview);
+    await this.reply(senderId, [
+      `已接入 Codex 会话：${codexSession.title}`,
+      `来源：${formatCodexSource(codexSession.source)}`,
+      `工作目录：${workspace}`,
+      `最近内容：${codexSession.preview}`,
+      "下一条消息将继续该 thread。"
     ].join("\n"));
   }
 
@@ -317,6 +498,150 @@ export class BridgeService {
     await this.reply(senderId, `本会话过程进度已${enabled ? "开启" : "关闭"}。`);
   }
 
+  private async handleGoalCommand(senderId: string, arg: string): Promise<void> {
+    const input = arg.trim();
+    const threadId = this.options.stateStore.getThread(senderId);
+    if (!input) {
+      if (!threadId) {
+        await this.reply(senderId, "当前会话还没有 Codex thread。先发送一条普通消息或使用 /goal <目标> 创建目标。");
+        return;
+      }
+      try {
+        const goal = await this.runner.getGoal(threadId);
+        await this.reply(senderId, goal ? formatGoal(goal) : "当前 Codex 会话没有目标。发送 /goal <目标> 设置。");
+      } catch (error) {
+        await this.reply(senderId, `无法读取目标：${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+
+    const [action, ...rest] = input.split(/\s+/);
+    const actionName = action.toLowerCase();
+    if (actionName === "pause" || actionName === "resume" || actionName === "clear" || actionName === "status" || actionName === "budget") {
+      await this.handleGoalControlCommand(senderId, actionName, rest.join(" "));
+      return;
+    }
+
+    const objective = actionName === "edit" ? rest.join(" ").trim() : input;
+    if (!objective) {
+      await this.reply(senderId, "用法：/goal edit <新的目标>。");
+      return;
+    }
+    if (objective.length > 4_000) {
+      await this.reply(senderId, "目标最多 4000 个字符。较长说明请写入文件，再让目标引用该文件。");
+      return;
+    }
+    await this.startGoal(senderId, { objective, status: "active" });
+  }
+
+  private async handleGoalControlCommand(senderId: string, action: string, arg: string): Promise<void> {
+    const threadId = this.options.stateStore.getThread(senderId);
+    if (!threadId) {
+      await this.reply(senderId, "当前会话还没有 Codex thread。先发送 /goal <目标>。");
+      return;
+    }
+    if (action === "status") {
+      try {
+        const goal = await this.runner.getGoal(threadId);
+        await this.reply(senderId, goal ? formatGoal(goal) : "当前 Codex 会话没有目标。");
+      } catch (error) {
+        await this.reply(senderId, `无法读取目标：${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    if (action === "budget") {
+      const budgetInput = arg.trim().toLowerCase();
+      if (!budgetInput) {
+        await this.reply(senderId, "用法：/goal budget <正整数> 或 /goal budget off。");
+        return;
+      }
+      const tokenBudget = budgetInput === "off" ? null : Number(budgetInput);
+      if (tokenBudget !== null && (!Number.isInteger(tokenBudget) || tokenBudget <= 0)) {
+        await this.reply(senderId, "目标 token 预算必须是正整数，或使用 off 清除。");
+        return;
+      }
+      await this.startGoal(senderId, { status: "active", tokenBudget }, false);
+      return;
+    }
+    if (action === "clear") {
+      try {
+        const cleared = await this.runner.clearGoal(threadId);
+        await this.reply(senderId, cleared ? "已清除当前目标。" : "当前会话没有可清除的目标。");
+      } catch (error) {
+        await this.reply(senderId, `无法清除目标：${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+
+    const status: CodexGoalStatus = action === "pause" ? "paused" : "active";
+    await this.startGoal(senderId, { status }, false);
+  }
+
+  private async startGoal(
+    senderId: string,
+    goalInput: { objective?: string; status: CodexGoalStatus; tokenBudget?: number | null },
+    announce = true
+  ): Promise<void> {
+    const session = this.options.stateStore.ensureActiveSession(senderId, this.options.config.defaultCwd);
+    const workspace = session.workspace ?? this.options.config.defaultCwd;
+    const progressEnabled = session.streamReplies ?? this.options.config.streamReplies;
+    const sentProgress = new Set<string>();
+    const targetThreadId = session.threadId;
+    const shouldObserve = goalInput.status === "active";
+    if (shouldObserve) {
+      this.options.onTurnStatus?.({ senderId, sessionId: session.id, active: true });
+    }
+    try {
+      const result = await this.runner.setGoal({
+        cwd: workspace,
+        threadId: targetThreadId,
+        model: session.model ?? this.options.config.model,
+        effort: session.effort ?? this.options.config.effort,
+        ...goalInput,
+        ...(shouldObserve ? {
+          onProgress: async (progress: string) => {
+            if (!progressEnabled) return;
+            const text = progress.trim();
+            if (!text || sentProgress.has(text)) return;
+            sentProgress.add(text);
+            await this.reply(senderId, `【目标进度】${text}`);
+          },
+          onFinal: async (runResult) => {
+            await this.sendCodexResult(senderId, runResult);
+          },
+          onError: async (error: Error) => {
+            await this.reply(senderId, `目标执行失败：${error.message}`);
+          },
+          onStopped: async () => {
+            this.options.onTurnStatus?.({ senderId, sessionId: session.id, active: false });
+          }
+        } : {})
+      });
+      this.options.stateStore.setThread(senderId, result.threadId);
+      if (announce) {
+        await this.reply(senderId, [
+          `目标已设置：${result.goal.objective}`,
+          `状态：${formatGoalStatus(result.goal.status)}`,
+          result.goal.status === "active"
+            ? "Codex 目标模式已启动，后续自动回合的最终回复会继续发送到这里。"
+            : "下一条消息或 /goal resume 可继续推进。"
+        ].join("\n"));
+      } else {
+        await this.reply(senderId, [
+          `目标已更新。`,
+          `状态：${formatGoalStatus(result.goal.status)}`,
+          `目标：${result.goal.objective}`,
+          formatGoalBudget(result.goal)
+        ].filter(Boolean).join("\n"));
+      }
+    } catch (error) {
+      if (shouldObserve) {
+        this.options.onTurnStatus?.({ senderId, sessionId: session.id, active: false });
+      }
+      throw error;
+    }
+  }
+
   private async promptItemsFromMessage(message: NormalizedWeixinMessage): Promise<PromptBufferItem[]> {
     const items: PromptBufferItem[] = [];
     if (message.text.trim()) {
@@ -370,17 +695,17 @@ export class BridgeService {
       this.options.stateStore.setSessionPromptPreview(session.id, promptPreview);
     }
     const workspace = this.options.stateStore.getWorkspace(message.senderId) ?? this.options.config.defaultCwd;
-    const threadId = this.options.stateStore.getThread(message.senderId) || undefined;
+    let currentThreadId = this.options.stateStore.getThread(message.senderId) || undefined;
     const progressEnabled = session.streamReplies ?? this.options.config.streamReplies;
     const sentProgress = new Set<string>();
     this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: true });
     try {
       await this.withTyping(message.senderId, async () => {
         console.log(`[codex-weixin] starting Codex turn for ${message.senderId} in ${workspace}`);
-        const result = await this.runner.run({
+        const run = () => this.runner.run({
           prompt: buildPrompt(text, attachments),
           cwd: workspace,
-          threadId,
+          threadId: currentThreadId,
           model: session.model ?? this.options.config.model,
           effort: session.effort ?? this.options.config.effort,
           ...(progressEnabled ? {
@@ -392,23 +717,42 @@ export class BridgeService {
             }
           } : {})
         });
-        console.log(`[codex-weixin] Codex turn completed for ${message.senderId}; text=${result.text.length} chars`);
-        if (result.threadId) {
-          this.options.stateStore.setThread(message.senderId, result.threadId);
-        }
-        const parsed = parseActionBlocks(result.text);
-        const remaining = chunkText(parsed.visibleText);
-        if (remaining.length) {
-          for (const chunk of remaining) {
-            await this.reply(message.senderId, chunk);
+        let result: Awaited<ReturnType<HybridCodexRunner["run"]>>;
+        try {
+          result = await run();
+        } catch (error) {
+          if (!currentThreadId || !isArchivedThreadError(error)) {
+            throw error;
           }
+          console.warn(`[codex-weixin] archived Codex thread ${currentThreadId}; starting a fresh thread`);
+          this.options.stateStore.setThread(message.senderId, "");
+          currentThreadId = undefined;
+          result = await run();
         }
-        for (const action of parsed.actions.send) {
-          await this.sendLocalMedia(message.senderId, action);
-        }
+        console.log(`[codex-weixin] Codex turn completed for ${message.senderId}; text=${result.text.length} chars`);
+        await this.sendCodexResult(message.senderId, result);
       });
     } finally {
       this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: false });
+    }
+  }
+
+  private async sendCodexResult(
+    senderId: string,
+    result: { text: string; threadId?: string }
+  ): Promise<void> {
+    if (result.threadId) {
+      this.options.stateStore.setThread(senderId, result.threadId);
+    }
+    const parsed = parseActionBlocks(result.text);
+    const remaining = chunkText(parsed.visibleText);
+    if (remaining.length) {
+      for (const chunk of remaining) {
+        await this.reply(senderId, chunk);
+      }
+    }
+    for (const action of parsed.actions.send) {
+      await this.sendLocalMedia(senderId, action);
     }
   }
 
@@ -524,6 +868,11 @@ export class BridgeService {
   }
 }
 
+function isArchivedThreadError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /thread\/(?:resume|loaded)|session .* is archived|is archived/i.test(message);
+}
+
 function parseCommand(text: string): { name: string; arg: string } | undefined {
   const trimmed = text.trim();
   if (!trimmed.startsWith("/")) {
@@ -541,6 +890,9 @@ function helpText(): string {
     "/bind <absolute-path> - bind this chat to a workspace",
     "/new - create a new managed Codex session",
     "/resume [R-number] - list or switch historical sessions",
+    "/sessions [keyword] - search and import other local Codex sessions",
+    "/session <S-number|id|name> - switch to a Codex session",
+    "/goal [objective] - set, edit, pause, resume, clear, or inspect a Codex goal",
     "/model [number|model-id|default] - view or switch this session's model",
     "/effort [number|level|default] - view or switch reasoning effort",
     "/stream [on|off|default] - view or switch streaming replies",
@@ -598,4 +950,71 @@ function formatEffort(effort?: string): string {
     ultra: "极高"
   };
   return labels[effort] ? `${labels[effort]}（${effort}）` : effort;
+}
+
+function formatCodexSessionList(sessions: CodexSessionSummary[], activeThreadId?: string): string {
+  return sessions.map((session, index) => {
+    const current = session.id === activeThreadId ? "【当前】" : "";
+    const model = session.model ? `，${session.model}` : "";
+    return [
+      `[S${index + 1}] ${current}${session.title}`,
+      `   来源：${formatCodexSource(session.source)}${model}｜更新：${formatSessionTime(session.updatedAt)}`,
+      `   目录：${session.workspace || "未知"}`,
+      `   摘要：${session.preview}`
+    ].join("\n");
+  }).join("\n\n");
+}
+
+function formatCodexSource(source: string): string {
+  const labels: Record<string, string> = {
+    cli: "Codex CLI",
+    vscode: "Codex Desktop",
+    appServer: "Codex app-server",
+    exec: "Codex exec",
+    unknown: "Codex"
+  };
+  return labels[source] ?? source;
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+function formatGoal(goal: CodexGoal): string {
+  return [
+    "当前 Codex 目标：",
+    goal.objective,
+    `状态：${formatGoalStatus(goal.status)}`,
+    `进度：${goal.tokensUsed} tokens · ${formatDuration(goal.timeUsedSeconds)}`,
+    formatGoalBudget(goal)
+  ].filter(Boolean).join("\n");
+}
+
+function formatGoalBudget(goal: CodexGoal): string {
+  return goal.tokenBudget === undefined
+    ? "预算：未设置"
+    : `预算：${goal.tokensUsed}/${goal.tokenBudget} tokens`;
+}
+
+function formatGoalStatus(status: CodexGoalStatus): string {
+  const labels: Record<CodexGoalStatus, string> = {
+    active: "进行中",
+    paused: "已暂停",
+    blocked: "受阻，需要处理",
+    usageLimited: "用量受限",
+    budgetLimited: "达到预算上限",
+    complete: "已完成"
+  };
+  return `${labels[status]}（${status}）`;
+}
+
+function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "0 秒";
+  const total = Math.floor(seconds);
+  const hours = Math.floor(total / 3_600);
+  const minutes = Math.floor((total % 3_600) / 60);
+  const remaining = total % 60;
+  if (hours) return `${hours} 小时 ${minutes} 分`;
+  if (minutes) return `${minutes} 分 ${remaining} 秒`;
+  return `${remaining} 秒`;
 }
