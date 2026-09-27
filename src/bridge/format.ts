@@ -81,7 +81,10 @@ export function stripBridgeInstructions(text: string): string {
 }
 
 export function chunkText(text: string, limit = 1800): string[] {
-  const normalized = text || "(empty reply)";
+  const normalized = text.trim();
+  if (!normalized) {
+    return [];
+  }
   if (normalized.length <= limit) {
     return [normalized];
   }
