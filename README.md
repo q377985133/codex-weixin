@@ -78,6 +78,12 @@ Web 端可以配置工作目录、Codex 后端、模型、推理强度和过程�
   <img src="docs/images/screenshots/web-global-settings.png" alt="codex-weixin Web 全局设置" width="100%" />
 </p>
 
+### 8. Codex 目标与全局会话接入
+
+微信端支持 Codex 原生的 Goal 模式命令，可以设置、查看、编辑、暂停、恢复和清除持久目标。自动目标回合产生的过程与最终回复会继续发送到当前微信会话。
+
+还可以按名称搜索本机其他 Codex CLI、Codex Desktop、app-server 和 `codex exec` 会话，并把选中的 thread 接入选定微信联系人的受管会话继续迭代。
+
 ## 环境要求
 
 - Node.js `>=22`
@@ -127,7 +133,7 @@ npm start
 
 ## 会话管理
 
-“会话”页面只管理由本服务创建和使用的 Codex 会话，不扫描或接管其他终端产生的全部 Codex 历史记录。
+“会话”页面管理由本服务创建和使用的 Codex 会话。微信端还可以通过 `/sessions` 搜索本机其他 Codex 会话，并在工作目录通过允许列表校验后接入继续使用。
 
 选择一个会话后，右侧会从 Codex 自身保存的 thread 中读取历史用户消息和最终回复。聊天标题下方可以为当前会话选择模型、推理强度和过程进度，或继续继承全局设置；这与微信 `/model`、`/effort`、`/stream` 共用同一份会话配置。过程进度默认开启，在 Web 中折叠展示并记录处理用时，最终答案仍作为一个完整回复显示。可以直接在页面底部继续聊天，并通过回形针按钮将文本提示词和多个文件作为同一个 turn 发送；Web 和微信共用同一个 thread，上下文会保持连续。上传文件按微信账号和会话隔离保存在 `~/.codex-weixin/inbound/`，每次最多 10 个、合计不超过 100 MiB。
 
@@ -139,6 +145,8 @@ npm start
 - “删除”只删除本服务中的会话记录，不删除 Codex 自身保存的历史文件。
 - 微信中的 `/new` 会立即为当前联系人创建新的受管会话。
 - 微信中的 `/resume` 会按最近更新时间列出当前联系人的历史会话、最近内容摘要和时间，并为每项生成 `R1`、`R2` 这类独立切换编号；发送 `/resume R1` 可切换并继续原来的 Codex thread，不会与“会话 6”这类名称混淆。
+- 微信中的 `/sessions [关键词]` 会搜索其他本机 Codex 会话；发送 `/session S1` 或 `/resume <会话名称>` 可接入并继续对应 thread。
+- `/goal <目标>` 启动 Codex Goal 模式。目标自动回合期间，进程进度和最终回复会继续发送到当前微信会话。
 
 ## 微信内命令
 
@@ -149,6 +157,16 @@ npm start
 /new                          创建新的受管 Codex 会话
 /resume                       查看历史会话、最近内容摘要和序号
 /resume R<编号>               按 R 切换编号继续指定的历史会话
+/resume <会话名称>            搜索并接入其他 Codex 会话
+/sessions [关键词]            搜索本机其他 Codex 会话
+/session <S编号|ID|名称>      切换并接入指定的 Codex 会话
+/goal                         查看当前 Codex 目标
+/goal <目标>                  设置或替换持久目标并启动 Goal 模式
+/goal edit <目标>             编辑当前目标
+/goal pause                   暂停当前目标
+/goal resume                  恢复并继续当前目标
+/goal clear                   清除当前目标
+/goal budget <正整数|off>     设置或清除目标 token 预算
 /model                        查看当前模型和可用模型
 /model <序号|模型 ID|default>  切换当前会话模型，或恢复继承设置
 /effort                       查看当前模型支持的推理强度
@@ -184,6 +202,10 @@ Codex 可以在最终回复中声明需要发送的本机文件：
 
 默认的 `codexBackend` 是 `auto`。第一次收到 Codex 消息时，服务会启动一个持久的 `codex app-server --stdio` 进程，并使用新版 `initialize`、`thread/*` 和 `turn/*` 协议。新会话和已有会话都优先通过 app-server 运行；如果 app-server 无法启动、握手或处理请求，会自动回退到 `codex exec` 或 `codex exec resume`。
 
+Goal 模式和其他本地 Codex 会话搜索依赖 app-server 的 `thread/goal/*` 与 `thread/list` 接口，不使用数据库旁路，也不会伪造普通用户消息。
+
+桥接运行会创建隔离的临时 `CODEX_HOME`：认证和模型提供方配置继续沿用，但不加载全局 MCP 与插件配置，避免某个未登录的外部集成中断微信任务。服务退出时会清理该临时目录。
+
 微信端目前没有 Codex 审批弹窗，因此 app-server 使用 `approvalPolicy: "never"`，只在现有 Codex sandbox 权限内执行，不会等待一个无法在微信中回答的本机审批请求。管理页仍可把后端固定为 `app-server` 或 `exec`，用于排查问题。
 
 ## 模型和推理强度
@@ -192,7 +214,7 @@ Codex 可以在最终回复中声明需要发送的本机文件：
 
 微信中发送 `/model` 或 `/effort` 可以查看带序号的选项，再用序号或英文 ID 切换。微信端设置只覆盖当前受管会话，不影响其他微信账号、联系人或会话；发送 `/model default`、`/effort default` 可恢复继承 Web/Codex 设置。Web 继续该会话时也会沿用这份会话设置。
 
-IkunCoding 提供方会额外显示 `gpt-5.6-sol`、`gpt-5.6-terra` 和 `gpt-5.6-luna`。切换到其他模型后，这三项仍会保留在下拉列表和微信 `/model` 列表中。微信发送 `/status` 可以查看当前生效的模型和推理强度。
+IkunCoding 提供方会额外显示 `gpt-6-astra`、`gpt-5.6-sol`、`gpt-5.6-terra` 和 `gpt-5.6-luna`。切换到其他模型后，这些选项仍会保留在下拉列表和微信 `/model` 列表中。微信发送 `/status` 可以查看当前生效的模型和推理强度。
 
 ## 本地数据
 
