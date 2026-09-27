@@ -30,8 +30,9 @@ Screenshots live under `docs/images/screenshots/`. The Web management screenshot
 | ✅ | Multiple WeChat accounts | One service runs multiple accounts with local remarks and isolated authorization, attachments, and sessions; account removal can retain history. | [Web sessions](docs/images/screenshots/web-session-management.png) |
 | ✅ | Browser QR connection | Shows waiting, scanned, connected, and expired QR states. | Pending: `docs/images/screenshots/wechat-qr-login.png` |
 | ✅ | Session management | Grouped account tabs, Markdown history, continued Codex threads, and create, rename, activate, reset, and delete actions. | [Web sessions](docs/images/screenshots/web-session-management.png) |
+| ✅ | Codex goals and global sessions | Set and manage Codex Goal mode from WeChat, search other local Codex sessions by name, and continue a selected thread. | Pending: `docs/images/screenshots/wechat-goal-session.png` |
 | ✅ | Web text and attachments | Send text with up to 10 files (100 MiB total), with media playback, preview, and download in history. | Pending: `docs/images/screenshots/web-attachments.png` |
-| ✅ | WeChat private-chat control | Supports regular messages plus `/status`, `/new`, `/resume`, `/bind`, `/model`, `/effort`, `/prompt start`, `/prompt done`, and `/stop`. | Pending: `docs/images/screenshots/wechat-chat.png` |
+| ✅ | WeChat private-chat control | Supports regular messages plus `/status`, `/new`, `/resume`, `/sessions`, `/session`, `/goal`, `/bind`, `/model`, `/effort`, `/prompt start`, `/prompt done`, and `/stop`. | Pending: `docs/images/screenshots/wechat-chat.png` |
 | ✅ | WeChat media input | Accepts transcribed voice, images, audio, video, and files up to 100 MiB each, with a direct notice when the limit is exceeded. | Pending: `docs/images/screenshots/wechat-media-input.png` |
 | ✅ | File delivery to WeChat | Codex can return local images, videos, and files as native WeChat messages. | Pending: `docs/images/screenshots/wechat-media-output.png` |
 | ✅ | Models and reasoning effort | Model-aware dropdowns loaded from app-server, including GPT-5.6 Sol, Terra, and Luna for IkunCoding. | Pending: `docs/images/screenshots/web-model-settings.png` |
@@ -96,7 +97,7 @@ Repeat the QR flow to add more accounts. Every account has its own monitor, send
 
 ## Session management
 
-The Sessions page manages conversations created and used by this server. It does not scan or take ownership of every Codex conversation created in other terminals.
+The Sessions page manages conversations created and used by this server. From WeChat, `/sessions` can also search other local Codex conversations and import a selected thread after its captured workspace passes the allowlist.
 
 Selecting a session reads its user messages and final replies from Codex's own persisted thread. The controls below the chat title select a model, reasoning effort, and process-progress behavior for the current session or keep inheriting global settings; they share the same session configuration used by the WeChat `/model`, `/effort`, and `/stream` commands. Process progress is enabled by default, appears in a collapsible Web timeline with elapsed time, and leaves the final answer as one stable response. The Web composer can submit text and multiple files as one turn and continues that same thread, so context remains shared with later WeChat messages. Uploads are isolated by account and session under `~/.codex-weixin/inbound/`, with at most 10 files and 100 MiB total per turn.
 
@@ -108,6 +109,8 @@ The UI uses local remarks instead of treating internal IDs as account names. Exp
 - Delete removes only the bridge record, not Codex's own history files.
 - `/new` creates a new managed session for the current sender.
 - `/resume` lists this sender's sessions with recent prompt summaries, timestamps, and distinct `R1`, `R2` selection codes; `/resume R1` switches back to the selected Codex thread without confusing the code with a title such as `Session 6`.
+- `/sessions [keyword]` searches other local Codex sessions; `/session S1` or `/resume <session name>` imports and continues the selected thread.
+- `/goal <objective>` starts Codex Goal mode. Progress and final answers from automatic goal turns continue to arrive in the same WeChat conversation.
 
 ## WeChat commands
 
@@ -118,6 +121,16 @@ The UI uses local remarks instead of treating internal IDs as account names. Exp
 /new                          Create a new managed Codex session
 /resume                       List historical sessions with recent prompt summaries
 /resume R<number>             Continue a session by its distinct R selection code
+/resume <session name>        Search for and import another Codex session
+/sessions [keyword]           Search other local Codex sessions
+/session <S-number|id|name>   Switch to a specific Codex session
+/goal                         Show the current Codex goal
+/goal <objective>             Set or replace a persistent goal and start Goal mode
+/goal edit <objective>        Edit the current goal
+/goal pause                   Pause the current goal
+/goal resume                  Resume and continue the current goal
+/goal clear                   Clear the current goal
+/goal budget <positive|off>   Set or clear the goal token budget
 /model                        Show the current and available models
 /model <number|model|default>  Switch this session's model or restore inheritance
 /effort                       Show reasoning efforts supported by the current model
@@ -153,6 +166,10 @@ Only absolute local paths are accepted. Native outbound types are `image`, `vide
 
 The default `codexBackend` is `auto`. On the first Codex message, the service starts one persistent `codex app-server --stdio` process and uses the current `initialize`, `thread/*`, and `turn/*` protocol. New and resumed conversations prefer app-server; startup, handshake, or request failures automatically fall back to `codex exec` or `codex exec resume`.
 
+Goal mode and global session search use the app-server `thread/goal/*` and `thread/list` APIs directly. They do not bypass Codex storage or simulate ordinary user messages.
+
+Bridge runs create an isolated temporary `CODEX_HOME`: authentication and model-provider configuration are preserved, while global MCP and plugin configuration is omitted so an unrelated integration cannot interrupt a WeChat turn. The temporary directory is removed when the service closes.
+
 WeChat does not currently expose Codex approval prompts, so app-server uses `approvalPolicy: "never"` and operates only within the configured Codex sandbox instead of waiting for an approval that cannot be answered in WeChat. The management page can still pin the backend to `app-server` or `exec` for diagnostics.
 
 ## Models and reasoning effort
@@ -161,7 +178,7 @@ The Settings page loads available models and model-specific reasoning efforts fr
 
 Send `/model` or `/effort` in WeChat to get a numbered list, then switch by number or exact ID. A WeChat-side selection applies only to the active managed session, without affecting other accounts, senders, or sessions. `/model default` and `/effort default` restore inheritance from Web/Codex settings. Continuing that session from the Web page uses the same session overrides.
 
-The IkunCoding provider also exposes `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. These options remain available after switching to another model in both the Web dropdown and WeChat `/model` list. Send `/status` in WeChat to inspect the effective model and reasoning effort.
+The IkunCoding provider also exposes `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. These options remain available after switching to another model in both the Web dropdown and WeChat `/model` list. Send `/status` in WeChat to inspect the effective model and reasoning effort.
 
 ## Local data
 
