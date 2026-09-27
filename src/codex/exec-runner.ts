@@ -48,6 +48,7 @@ export function buildCodexExecArgs(input: BuildCodexExecArgsInput): string[] {
 
 export type CodexExecRunnerOptions = {
   codexBin?: string;
+  codexHome?: string;
   sandbox?: CodexExecSandbox;
   timeoutMs?: number;
 };
@@ -76,7 +77,10 @@ export class CodexExecRunner {
         cwd: input.cwd,
         stdio: ["ignore", "pipe", "pipe"],
         shell: false,
-        windowsHide: true
+        windowsHide: true,
+        env: this.options.codexHome
+          ? { ...process.env, CODEX_HOME: this.options.codexHome }
+          : undefined
       });
       const activeRun = { child, threadId: input.threadId };
       this.activeRuns.push(activeRun);
